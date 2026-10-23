@@ -4,7 +4,7 @@
  * Replaces the Cloudflare stack on a single VPS process/port:
  *   - Cloudflare Pages static hosting  -> built-in static file server
  *   - functions/api/[[path]].js (Pages Functions) -> direct onRequest() invocation
- *   - D1 (SQLite)                      -> better-sqlite3 D1-compatible adapter
+ *   - D1 (SQLite)                      -> node:sqlite D1-compatible adapter
  *   - Realtime Worker + Durable Objects -> in-process WebSocket hub
  *   - caches.default / env.ASSETS      -> in-memory cache / local file reads
  *
@@ -16,12 +16,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { WebSocketServer } from 'ws';
-import { onRequest, onRequestScheduled } from './functions/api/[[path]].js';
+import { onRequest, onRequestScheduled } from './vendor/K-UI/functions/api/[[path]].js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const webRoot = path.join(__dirname, 'vendor', 'K-UI');
 const PORT = Number(process.env.PORT || 3000);
+if (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD.length < 16) {
+  throw new Error('ADMIN_PASSWORD must contain at least 16 characters');
+}
 const PANEL_ORIGIN = (process.env.PANEL_ORIGIN || `http://localhost:${PORT}`).replace(/\/$/, '');
 
 // ==========================================
@@ -57,10 +61,10 @@ if (!globalThis.caches) {
 // ==========================================
 // 2. Cloudflare D1 (SQLite) compatible adapter
 // ==========================================
-fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-const sqlite = new Database(path.join(__dirname, 'data', 'kui.db'));
-sqlite.pragma('journal_mode = WAL');
-sqlite.pragma('foreign_keys = ON');
+const databasePath = process.env.DATABASE_PATH || path.join(__dirname, 'data', 'kui.db');
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+const sqlite = new DatabaseSync(databasePath, { enableDoubleQuotedStringLiterals: true });
+sqlite.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
 
 class D1Statement {
   constructor(db, sql, params = []) {
@@ -79,7 +83,7 @@ class D1Statement {
   _exec() {
     const stmt = this.db.prepare(this.sql);
     const args = this._normalized();
-    if (stmt.reader) {
+    if (stmt.columns().length) {
       const rows = stmt.all(...args);
       return { reader: true, rows, info: null };
     }
@@ -109,14 +113,19 @@ const d1Adapter = {
     return new D1Statement(sqlite, sql);
   },
   async batch(statements) {
-    const runAll = sqlite.transaction((stmts) =>
-      stmts.map((s) => {
+    sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      const results = statements.map((s) => {
         const out = s._exec();
         if (out.reader) return { results: out.rows, success: true, meta: {} };
         return { success: true, meta: { changes: out.info.changes } };
-      })
-    );
-    return runAll(statements);
+      });
+      sqlite.exec('COMMIT');
+      return results;
+    } catch (error) {
+      sqlite.exec('ROLLBACK');
+      throw error;
+    }
   },
 };
 
@@ -141,8 +150,9 @@ const MIME_TYPES = {
 };
 
 function safeLocalFile(relPath) {
-  const resolved = path.resolve(__dirname, relPath);
-  if (!resolved.startsWith(path.resolve(__dirname) + path.sep) && resolved !== path.resolve(__dirname)) {
+  if (relPath !== 'index.html' && !/^vps\/[a-zA-Z0-9_.-]+$/.test(relPath)) return null;
+  const resolved = path.resolve(webRoot, relPath);
+  if (!resolved.startsWith(webRoot + path.sep)) {
     return null;
   }
   if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) return null;
@@ -179,7 +189,7 @@ const env = {
   TG_CHAT_ID: process.env.TG_CHAT_ID || '',
   ASSETS: {
     async fetch(req) {
-      const u = new URL(typeof req === 'string' ? req : req.url);
+      const u = new URL(req instanceof URL ? req.href : typeof req === 'string' ? req : req.url);
       const resolved = safeLocalFile(u.pathname.replace(/^\/+/, ''));
       if (!resolved) return new Response('Asset not found', { status: 404 });
       const ext = path.extname(resolved).toLowerCase();
@@ -384,10 +394,12 @@ const server = http.createServer(async (req, res) => {
       if (Array.isArray(v)) v.forEach((val) => headers.append(k, val));
       else if (v !== undefined) headers.set(k, v);
     }
-    const clientIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
+    const peer = req.socket.remoteAddress || '';
+    const trustedProxy = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(peer);
+    const clientIp = String((trustedProxy && req.headers['x-forwarded-for']) || peer)
       .split(',')[0]
       .trim();
-    if (!headers.has('CF-Connecting-IP')) headers.set('CF-Connecting-IP', clientIp);
+    headers.set('CF-Connecting-IP', clientIp);
 
     const chunks = [];
     if (!['GET', 'HEAD'].includes(req.method)) {
