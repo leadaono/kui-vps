@@ -1,0 +1,19 @@
+[Unit]
+Description=K-UI Self-Hosted Panel (kui-vps)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kui-panel
+Environment="PORT=3000"
+Environment="PANEL_ORIGIN=https://你的面板域名"
+Environment="REALTIME_URL=https://你的面板域名"
+Environment="ADMIN_USERNAME=admin"
+Environment="ADMIN_PASSWORD=你的16位以上强密码"
+ExecStart=/usr/bin/node /opt/kui-panel/server.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

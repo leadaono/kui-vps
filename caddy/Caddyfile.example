@@ -1,0 +1,7 @@
+你的面板域名 {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up CF-Connecting-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
+}
