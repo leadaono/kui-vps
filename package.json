@@ -9,10 +9,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.5.0",
     "ws": "^8.18.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   }
 }
