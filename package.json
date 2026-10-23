@@ -1,0 +1,18 @@
+{
+  "name": "kui-vps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "K-UI self-hosted on VPS (Node.js runtime replacing Cloudflare Pages/D1/Workers)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
