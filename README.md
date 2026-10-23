@@ -70,4 +70,4 @@ node test/smoke.mjs
 
 前端仍使用 Vue、Tailwind 等第三方 CDN，地图、测速、软件包安装等功能也可能访问第三方服务；独立部署指不依赖上游 K-UI 仓库或 Cloudflare 运行平台，不代表离线运行。
 
-源码来源：[a6216abcd/K-UI](https://github.com/a6216abcd/K-UI)，保留 `vendor/K-UI` 中的来源说明。当前快照未包含独立 LICENSE 文件，请在进一步分发前确认上游许可。
+源码来源：[a6216abcd/K-UI](https://github.com/a6216abcd/K-UI)。`vendor/K-UI` 仅保留当前 VPS 运行所需的前端、API 和 Agent 文件。当前快照未包含独立 LICENSE 文件，请在进一步分发前确认上游许可。
