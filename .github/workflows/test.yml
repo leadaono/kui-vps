@@ -1,0 +1,17 @@
+name: Self-hosted runtime
+on: [push, pull_request]
+jobs:
+ smoke:
+  runs-on: ubuntu-latest
+  strategy:
+   matrix:
+    node: [22, 24]
+  steps:
+   - uses: actions/checkout@v4
+   - uses: actions/setup-node@v4
+     with:
+      node-version: ${{ matrix.node }}
+      cache: npm
+   - run: npm ci
+   - run: bash -n install-panel.sh && sh -n install.sh && node --check server.js
+   - run: node test/smoke.mjs
