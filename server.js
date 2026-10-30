@@ -12,6 +12,7 @@
  */
 
 import http from 'node:http';
+import { isIP } from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -27,6 +28,13 @@ if (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD.length < 16) {
   throw new Error('ADMIN_PASSWORD must contain at least 16 characters');
 }
 const PANEL_ORIGIN = (process.env.PANEL_ORIGIN || `http://localhost:${PORT}`).replace(/\/$/, '');
+// Hard ceiling for buffered request bodies (Issue #3). The API layer keeps its
+// own smaller per-route limits (256 KB max today); this server-layer cap only
+// stops unbounded in-memory buffering. Override with KUI_MAX_BODY_BYTES.
+const MAX_BODY_BYTES = (() => {
+  const n = Number(process.env.KUI_MAX_BODY_BYTES);
+  return Number.isSafeInteger(n) && n > 0 ? n : 1024 * 1024;
+})();
 
 // ==========================================
 // 1. Polyfill Cloudflare caches.default
@@ -396,14 +404,53 @@ const server = http.createServer(async (req, res) => {
     }
     const peer = req.socket.remoteAddress || '';
     const trustedProxy = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(peer);
-    const clientIp = String((trustedProxy && req.headers['x-forwarded-for']) || peer)
-      .split(',')[0]
-      .trim();
+    // The client IP feeds the login throttle, so it must be what the trusted
+    // local proxy (Caddy) actually observed — never the first
+    // X-Forwarded-For segment, which is claimed by the requester and can be
+    // rotated per request to bypass rate limits (Issue #2). Preference:
+    //   1. CF-Connecting-IP as overwritten by Caddy via
+    //      `header_up CF-Connecting-IP {remote_host}` (see install-panel.sh);
+    //   2. the LAST X-Forwarded-For segment (the one the nearest trusted
+    //      proxy appended);
+    //   3. the direct peer address.
+    // Forwarding headers from an untrusted peer are ignored entirely.
+    let clientIp = peer;
+    if (trustedProxy) {
+      const fromCaddy = String(req.headers['cf-connecting-ip'] || '').trim();
+      const xffParts = String(req.headers['x-forwarded-for'] || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const fromXffTail = xffParts.length ? xffParts[xffParts.length - 1] : '';
+      if (isIP(fromCaddy)) clientIp = fromCaddy;
+      else if (isIP(fromXffTail)) clientIp = fromXffTail;
+    }
     headers.set('CF-Connecting-IP', clientIp);
 
     const chunks = [];
+    let bodyTooLarge = false;
     if (!['GET', 'HEAD'].includes(req.method)) {
-      for await (const chunk of req) chunks.push(chunk);
+      // Count actual bytes (Content-Length can lie or be absent). Once over
+      // the cap, release the buffer and drain-and-discard the rest, then
+      // answer 413: memory stays bounded and well-behaved clients reliably
+      // receive the response (Issue #3).
+      let bodyBytes = 0;
+      for await (const chunk of req) {
+        if (bodyTooLarge) continue;
+        bodyBytes += chunk.length;
+        if (bodyBytes > MAX_BODY_BYTES) {
+          bodyTooLarge = true;
+          chunks.length = 0;
+          continue;
+        }
+        chunks.push(chunk);
+      }
+    }
+    if (bodyTooLarge) {
+      res.statusCode = 413;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: 'Payload Too Large' }));
+      return;
     }
     const webReq = new Request(fullUrl.toString(), {
       method: req.method,

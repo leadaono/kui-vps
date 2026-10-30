@@ -64,7 +64,7 @@ if ! grep -qF 'import /etc/caddy/kui-sites/*.caddy' /etc/caddy/Caddyfile; then
  cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.backup.$(date +%s)"
  printf '\nimport /etc/caddy/kui-sites/*.caddy\n' >> /etc/caddy/Caddyfile
 fi
-printf '%s {\n reverse_proxy 127.0.0.1:3000\n}\n' "$DOMAIN" > /etc/caddy/kui-sites/kui-panel.caddy
+printf '%s {\n reverse_proxy 127.0.0.1:3000 {\n  header_up CF-Connecting-IP {remote_host}\n  header_up X-Forwarded-Proto {scheme}\n  header_up X-Forwarded-Host {host}\n }\n}\n' "$DOMAIN" > /etc/caddy/kui-sites/kui-panel.caddy
 chmod 644 /etc/caddy/kui-sites/kui-panel.caddy
 caddy validate --config /etc/caddy/Caddyfile
 systemctl daemon-reload
