@@ -505,6 +505,13 @@ async function initializeDbSchema(db) {
     try { await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
 
+    const { results: serverColumns } = await db.prepare('PRAGMA table_info(servers)').all();
+    if (!serverColumns.some(column => column.name === 'sort_order')) {
+        await db.prepare('ALTER TABLE servers ADD COLUMN sort_order INTEGER').run();
+    }
+    // Preserve the existing insertion order when upgrading a database.
+    await db.prepare('UPDATE servers SET sort_order = rowid * 10 WHERE sort_order IS NULL').run();
+
     const probeQueries = [
         `CREATE TABLE IF NOT EXISTS probe_settings (key TEXT PRIMARY KEY, value TEXT)`,
         `CREATE TABLE IF NOT EXISTS probe_servers (
@@ -709,7 +716,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
         const authHeader = request.headers.get("Authorization");
         const isLoggedIn = await verifyAuth(authHeader, request, db, env, context);
         if (settings.is_public !== 'true' && !isLoggedIn) return Response.json({ error: "Private Dashboard" }, { status: 401 });
-        const servers = (await db.prepare('SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != "true"').all()).results;
+        const servers = (await db.prepare('SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total, s.sort_order FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != "true" ORDER BY COALESCE(s.sort_order, 2147483647), s.ip').all()).results;
         const publicKeys = new Set(['theme', 'is_public', 'site_title', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'custom_css', 'custom_bg', 'custom_head', 'custom_script', 'report_interval', 'enable_popup', 'popup_content', 'cached_nodes_data', 'auto_reset_traffic', 'visits_total', 'visits_today', 'visits_date']);
         for (const key of Object.keys(settings)) if (!publicKeys.has(key)) delete settings[key];
         const realtime = env.REALTIME_URL ? null : await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
@@ -747,7 +754,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
     if (method === 'GET' && subPath === 'admin/data') {
         const settings = {};
         try { const { results } = await db.prepare('SELECT * FROM probe_settings').all(); if (results) results.forEach(r => settings[r.key] = r.value); } catch(e){}
-        const servers = (await db.prepare('SELECT id, name, last_updated, server_group, price, expire_date, bandwidth, traffic_limit, agent_os, is_hidden, reset_day FROM probe_servers').all()).results;
+        const servers = (await db.prepare('SELECT p.id, p.name, p.last_updated, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.agent_os, p.is_hidden, p.reset_day, s.sort_order FROM probe_servers p LEFT JOIN servers s ON s.ip = p.id ORDER BY COALESCE(s.sort_order, 2147483647), p.id').all()).results;
         return Response.json({ settings, servers });
     }
     
@@ -1572,10 +1579,34 @@ rules:
     if (!currentUser) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
     try {
+        if (action === 'server_order' && method === 'PUT') {
+            if (!isAdmin) return Response.json({ error: 'Forbidden' }, { status: 403 });
+            let body;
+            try { body = await readJsonBody(request, 16 * 1024); }
+            catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+            const orders = body?.orders;
+            if (!Array.isArray(orders) || orders.length < 1 || orders.length > 100)
+                return Response.json({ error: 'Invalid orders' }, { status: 400 });
+            const ids = new Set();
+            for (const item of orders) {
+                if (!item || typeof item.ip !== 'string' || ids.has(item.ip) ||
+                    !Number.isInteger(item.sort_order) || item.sort_order < 1 || item.sort_order > 1000000000)
+                    return Response.json({ error: '序号必须是 1 到 1000000000 的整数，服务器不可重复' }, { status: 400 });
+                ids.add(item.ip);
+                if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(item.ip).first()))
+                    return Response.json({ error: 'Server not found' }, { status: 404 });
+            }
+            await db.batch(orders.map(item => db.prepare('UPDATE servers SET sort_order = ? WHERE ip = ?').bind(item.sort_order, item.ip)));
+            // Only public display cache is invalidated; node credentials/configuration are untouched.
+            if (typeof caches?.default?.delete === 'function') {
+                await Promise.all([0, 1].map(ajax => caches.default.delete(new Request(`${new URL(request.url).origin}/api/probe/public?ajax=${ajax}`))));
+            }
+            return Response.json({ success: true });
+        }
         if (action === "data") {
             const servers = isAdmin
-                ? (await db.prepare("SELECT * FROM servers").all()).results
-                : (await db.prepare("SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn FROM servers").all()).results;
+                ? (await db.prepare("SELECT * FROM servers ORDER BY COALESCE(sort_order, 2147483647), ip").all()).results
+                : (await db.prepare("SELECT ip, name, cpu, mem, last_report, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn, sort_order FROM servers ORDER BY COALESCE(sort_order, 2147483647), ip").all()).results;
             if (isAdmin) {
                 for (const server of servers) {
                     if (!server.agent_token) {
@@ -1625,7 +1656,7 @@ rules:
         
         if (action === "vps" && isAdmin) {
             await ensureDbSchema(db);
-            if (method === "POST") { const { ip, name } = await request.json(); if (!/^[0-9A-Fa-f:.]{2,64}$/.test(String(ip || ''))) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 }); const agentToken = crypto.randomUUID(); const inserted = await db.prepare("INSERT INTO servers (ip, name, alert_sent, agent_token) SELECT ?, ?, 0, ? WHERE (SELECT COUNT(*) FROM servers) < 100 ON CONFLICT(ip) DO NOTHING RETURNING ip").bind(ip, String(name || ip).slice(0, 100), agentToken).first(); if (!inserted) { if (await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(ip).first()) return Response.json({ error: 'VPS already exists' }, { status: 409 }); return Response.json({ error: "当前版本最多管理 100 台 VPS" }, { status: 409 }); } return Response.json({ success: true }); }
+            if (method === "POST") { const { ip, name } = await request.json(); if (!/^[0-9A-Fa-f:.]{2,64}$/.test(String(ip || ''))) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 }); const agentToken = crypto.randomUUID(); const inserted = await db.prepare("INSERT INTO servers (ip, name, alert_sent, agent_token, sort_order) SELECT ?, ?, 0, ?, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM servers) WHERE (SELECT COUNT(*) FROM servers) < 100 ON CONFLICT(ip) DO NOTHING RETURNING ip").bind(ip, String(name || ip).slice(0, 100), agentToken).first(); if (!inserted) { if (await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(ip).first()) return Response.json({ error: 'VPS already exists' }, { status: 409 }); return Response.json({ error: "当前版本最多管理 100 台 VPS" }, { status: 409 }); } return Response.json({ success: true }); }
             if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: 'IP required' }, { status: 400 }); if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 }); const modes = ['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']; if (!modes.includes(data.egress_mode)) return Response.json({ error: 'Invalid egress mode' }, { status: 400 }); if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 }); if (data.egress_mode === 'residential' && (!env.PROXY_USER || !env.PROXY_PASS)) return Response.json({ error: 'Pages 未配置住宅代理凭据' }, { status: 503 }); const proxyMode = data.proxy_mode === 'selective' ? 'selective' : 'global'; const proxyCategories = data.proxy_categories ? String(data.proxy_categories) : ''; const socks5Addr = String(data.socks5_addr || '').slice(0, 128); const socks5Port = Math.min(65535, Math.max(1, Number(data.socks5_port) || 0)); const socks5User = String(data.socks5_user || '').slice(0, 64); const socks5Pass = String(data.socks5_pass || '').slice(0, 128); let changed; if (data.egress_mode === 'socks5' && socks5Addr && socks5Port) { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, socks5Addr, socks5Port, socks5User, socks5Pass, ip).first(); } else { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, ip).first(); } if (!changed) return Response.json({ error: 'VPS not found' }, { status: 404 }); context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {})); return Response.json({ success: true, ip, egress_mode: data.egress_mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, socks5_addr: data.egress_mode === 'socks5' ? socks5Addr : '', socks5_port: data.egress_mode === 'socks5' ? socks5Port : 0 }); }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
