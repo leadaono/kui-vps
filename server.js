@@ -43,6 +43,9 @@ const memoryCache = new Map();
 if (!globalThis.caches) {
   globalThis.caches = {
     default: {
+      async delete(req) {
+        return memoryCache.delete(typeof req === 'string' ? req : req.url);
+      },
       async match(req) {
         const key = typeof req === 'string' ? req : req.url;
         const item = memoryCache.get(key);
