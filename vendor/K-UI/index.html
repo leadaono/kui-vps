@@ -909,13 +909,18 @@
 
                     <div class="bg-white/60 backdrop-blur-xl p-8 rounded-[2.5rem] border border-white shadow-xl shadow-slate-200/40">
                         <h3 class="text-xl font-black text-slate-800 mb-2 flex items-center gap-2">💻 探针服务端管理</h3>
+                        <div class="flex flex-wrap items-center gap-3 mb-4">
+                            <button @click="saveServerOrder" :disabled="savingServerOrder || !hasServerOrderChanges" class="bg-blue-600 text-white px-4 py-2 rounded-xl text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">{{ savingServerOrder ? '保存中…' : '保存排序' }}</button>
+                            <span class="text-xs text-slate-500">数字越小越靠前；服务器首页与探针大盘共用，分组内按序号排列。</span>
+                            <span role="status" aria-live="polite" class="text-xs font-medium">{{ serverOrderMessage }}</span>
+                        </div>
                         <p class="text-sm text-slate-500 mb-6 font-medium">提示：探针大盘已与 KUI Agent 深度统一！您在“服务器与节点”页面接入的机器会<b>自动</b>出现在此处。在这里只需维护展示信息即可，无需再次安装脚本。</p>
 
                         <div class="overflow-x-auto bg-white rounded-2xl border border-slate-100 shadow-sm">
                             <table class="w-full text-left border-collapse text-sm">
-                                <thead><tr class="bg-slate-50 text-slate-500 font-bold border-b border-slate-100"><th class="p-4">节点名称</th><th class="p-4">分组</th><th class="p-4">状态</th><th class="p-4">操作</th></tr></thead>
+                                <thead><tr class="bg-slate-50 text-slate-500 font-bold border-b border-slate-100"><th class="p-4">节点名称</th><th class="p-4">分组</th><th class="p-4">状态</th><th class="p-4">操作</th><th class="p-4 whitespace-nowrap">排序序号</th></tr></thead>
                                 <tbody>
-                                    <tr v-if="adminProbeServers.length===0"><td colspan="4" class="p-6 text-center text-slate-400">暂无探针，请在上方添加</td></tr>
+                                    <tr v-if="adminProbeServers.length===0"><td colspan="5" class="p-6 text-center text-slate-400">暂无探针，请在上方添加</td></tr>
                                     <tr v-for="s in adminProbeServers" :key="s.id" class="border-b border-slate-50 hover:bg-slate-50">
                                         <td class="p-4 font-bold text-slate-700">{{ s.name }} <span v-if="s.is_hidden==='true'" class="text-[10px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded">隐藏</span></td>
                                         <td class="p-4">{{ s.server_group || '默认分组' }}</td>
@@ -923,6 +928,9 @@
                                         <td class="p-4 flex gap-2">
                                             <button @click="openProbeEditModal(s)" class="bg-blue-50 text-blue-600 hover:bg-blue-100 px-3 py-1.5 rounded-lg font-bold transition">编辑展示信息</button>
                                             <button @click="deleteProbeNode(s.id)" class="bg-rose-50 text-rose-600 hover:bg-rose-100 px-3 py-1.5 rounded-lg font-bold transition">删除记录</button>
+                                        </td>
+                                        <td class="p-4">
+                                            <input type="number" min="1" max="1000000000" step="1" :aria-label="'排序序号：' + s.name" :value="Object.prototype.hasOwnProperty.call(sortOrderDrafts, s.id) ? sortOrderDrafts[s.id] : s.sort_order" @input="sortOrderDrafts[s.id] = $event.target.value; serverOrderMessage = ''" :disabled="savingServerOrder || s.sort_order == null" class="w-28 border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono disabled:opacity-50">
                                         </td>
                                     </tr>
                                 </tbody>
@@ -1056,6 +1064,10 @@
                 const currentFilter = ref('all');
 
                 const adminProbeServers = ref([]);
+                const sortOrderDrafts = reactive({});
+                const savingServerOrder = ref(false);
+                const serverOrderMessage = ref('');
+                const hasServerOrderChanges = computed(() => adminProbeServers.value.some(s => Object.prototype.hasOwnProperty.call(sortOrderDrafts, s.id)));
                 const probeEditModalOpen = ref(false); const editingProbeNode = ref({});
                 
                 const qrModalOpen = ref(false);
@@ -1259,7 +1271,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     } catch (e) { alert('登录异常'); }
                 };
                 
-                const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; adminProbeServers.value = []; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
+                const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; adminProbeServers.value = []; Object.keys(sortOrderDrafts).forEach(id => delete sortOrderDrafts[id]); serverOrderMessage.value = ''; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
                 const logout = () => { authGeneration++; localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; clearPrivateState(); activeTab.value = 'probe'; realtimeGeneration++; realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
                 const sendUiPing = async () => { try { await fetchApi('/api/ui_ping', { method: 'POST' }); } catch(e) {} };
 
@@ -1364,7 +1376,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                             const liveByIp = new Map(publicProbeServers.value.filter(item => item._realtime_ts).map(item => [normalizeRealtimeKey(item.id), item]));
                             publicProbeServers.value = (data.servers || []).map(item => {
                                 const live = liveByIp.get(normalizeRealtimeKey(item.id));
-                                return live && live._realtime_ts > Number(item.last_updated || 0) ? { ...item, ...live } : item;
+                                return live && live._realtime_ts > Number(item.last_updated || 0) ? { ...item, ...live, sort_order: item.sort_order } : item;
                             });
                             if (data.realtime_url && data.realtime_url !== realtimeUrl.value) realtimeUrl.value = data.realtime_url;
                             // A logged-in admin must use the Dashboard channel even
@@ -1409,7 +1421,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     try {
                         const res = await fetchApi('/api/data'); const data = await res.json();
                         const liveByIp = new Map(servers.value.filter(item => item._realtime_ts).map(item => [normalizeRealtimeKey(item.ip), item]));
-                        servers.value = (data.servers || []).map(item => { const live = liveByIp.get(normalizeRealtimeKey(item.ip)); return live && live._realtime_ts > Number(item.last_report || 0) ? { ...item, ...live } : item; }); nodes.value = data.nodes || []; users.value = data.users || [];
+                        servers.value = (data.servers || []).map(item => { const live = liveByIp.get(normalizeRealtimeKey(item.ip)); return live && live._realtime_ts > Number(item.last_report || 0) ? { ...item, ...live, sort_order: item.sort_order } : item; }); nodes.value = data.nodes || []; users.value = data.users || [];
                         if (data.siteTitle) { siteTitle.value = data.siteTitle; siteTitleInput.value = data.siteTitle; }
                         if (data.mySubToken) mySubToken.value = data.mySubToken;
                         if (data.realtimeUrl && data.realtimeUrl !== realtimeUrl.value) { realtimeUrl.value = data.realtimeUrl; connectRealtime(); }
@@ -1572,6 +1584,26 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     }
                 };
                 const openProbeEditModal = (s) => { editingProbeNode.value = JSON.parse(JSON.stringify(s)); if(!editingProbeNode.value.is_hidden) editingProbeNode.value.is_hidden = 'false'; if(!editingProbeNode.value.reset_day) editingProbeNode.value.reset_day = '1'; probeEditModalOpen.value = true; };
+                const saveServerOrder = async () => {
+                    if (savingServerOrder.value) return;
+                    const rows = adminProbeServers.value.filter(s => Object.prototype.hasOwnProperty.call(sortOrderDrafts, s.id));
+                    if (!rows.length) return;
+                    const orders = rows.map(s => ({ ip: s.id, sort_order: Number(sortOrderDrafts[s.id]) }));
+                    if (orders.some(s => !Number.isInteger(s.sort_order) || s.sort_order < 1 || s.sort_order > 1000000000)) {
+                        serverOrderMessage.value = '序号必须是 1 到 1000000000 的整数'; return;
+                    }
+                    savingServerOrder.value = true;
+                    serverOrderMessage.value = '';
+                    try {
+                        const response = await fetchApi('/api/server_order', { method: 'PUT', body: JSON.stringify({ orders }) });
+                        const result = await response.json();
+                        if (!response.ok || !result.success) throw new Error(result.error || '排序保存失败');
+                        rows.forEach(s => { delete sortOrderDrafts[s.id]; });
+                        await refreshData(); await fetchProbeData();
+                        serverOrderMessage.value = '排序已保存，两处页面均已更新';
+                    } catch (error) { serverOrderMessage.value = error.message || '保存失败，请重试'; }
+                    finally { savingServerOrder.value = false; }
+                };
                 const saveProbeEdit = async () => { await fetchApi('/api/probe/admin/server', { method: 'PUT', body: JSON.stringify(editingProbeNode.value) }); probeEditModalOpen.value = false; refreshData(); fetchProbeData(); };
                 const deleteProbeNode = async (id) => { if (!confirm("⚠️ 确定要彻底删除该探针记录吗？如果机器还在运行 Agent，之后会自动复活！请确保先在面板的「服务器与节点」中删除此机器。")) return; await fetchApi(`/api/probe/admin/server?id=${id}`, { method: 'DELETE' }); refreshData(); fetchProbeData(); };
                 
@@ -1782,7 +1814,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateSubLink, copyCommand,
                     globalOnline, globalTraffic, globalSpeedIn, globalSpeedOut, deployOsMap, saveOsMap, siteTitle, siteTitleInput, saveSiteTitle, userNewPassword, updateUserPassword, resetMySubLink, generateUUIDForNewUser, batchStartPort, batchUser, deployAllProtocols,
                     probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
-                    saveProbeSettings, saveSubscriptionProtection, adminProbeServers, probeEditModalOpen, editingProbeNode, openProbeEditModal, saveProbeEdit, deleteProbeNode, currentDomain,
+                    saveProbeSettings, saveSubscriptionProtection, saveServerOrder, sortOrderDrafts, savingServerOrder, serverOrderMessage, hasServerOrderChanges, adminProbeServers, probeEditModalOpen, editingProbeNode, openProbeEditModal, saveProbeEdit, deleteProbeNode, currentDomain,
                     thirdPartySubscriptions, newThirdParty, loadingThirdParty, loadThirdPartySubscriptions, addThirdPartySubscription, toggleThirdPartySubscription, deleteThirdPartySubscription,
                     qrModalOpen, qrCodeImage, showQrCode, 
                     showWelcomePopup, closePopup,
