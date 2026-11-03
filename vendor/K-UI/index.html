@@ -1067,7 +1067,7 @@
                 const sortOrderDrafts = reactive({});
                 const savingServerOrder = ref(false);
                 const serverOrderMessage = ref('');
-                const hasServerOrderChanges = computed(() => adminProbeServers.value.some(s => Object.prototype.hasOwnProperty.call(sortOrderDrafts, s.id)));
+                const hasServerOrderChanges = computed(() => Object.keys(sortOrderDrafts).some(id => adminProbeServers.value.some(s => s.id === id)));
                 const probeEditModalOpen = ref(false); const editingProbeNode = ref({});
                 
                 const qrModalOpen = ref(false);
