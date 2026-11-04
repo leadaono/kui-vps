@@ -501,8 +501,6 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
-    // Keep credentials outside probe_settings, whose values are returned to the settings UI.
-    await db.prepare('CREATE TABLE IF NOT EXISTS residential_credentials (ip TEXT PRIMARY KEY, username TEXT NOT NULL, password TEXT NOT NULL)').run();
     try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
@@ -839,51 +837,15 @@ async function proxyBridge(method, subPath, request, env, body = null) {
     }
 }
 
-async function residentialCredentials(db, env, ip) {
-    if (ip) {
-        const row = await db.prepare('SELECT username, password FROM residential_credentials WHERE ip = ?').bind(ip).first();
-        if (row) return { user: row.username, pass: row.password, source: 'server' };
-    }
-    return { user: env.PROXY_USER || '', pass: env.PROXY_PASS || '', source: 'global' };
-}
-
 async function proxyLocal(method, subPath, req, env, body = null) {
     const db = env.DB;
     await ensureDbSchema(db);
     const url = new URL(req.url);
-
-    if (subPath === 'credentials') {
-        if (method === 'GET') {
-            const ip = url.searchParams.get('ip');
-            if (!validIp(ip)) return Response.json({ error: 'Invalid IP' }, { status: 400 });
-            if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 });
-            const credentials = await residentialCredentials(db, env, ip);
-            return Response.json({ ip, source: credentials.source, configured: !!(credentials.user && credentials.pass) }, { headers: { 'Cache-Control': 'no-store' } });
-        }
-        if (method !== 'PUT') return Response.json({ error: 'Method not allowed' }, { status: 405 });
-        let data;
-        try { data = await readJsonBody(req, 4096); }
-        catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
-        if (!data || !validIp(data.ip)) return Response.json({ error: 'Invalid IP' }, { status: 400 });
-        if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(data.ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 });
-        if (data.inherit === true) {
-            if (data.user !== undefined || data.pass !== undefined) return Response.json({ error: 'Cannot combine inherit and credentials' }, { status: 400 });
-            await db.prepare('DELETE FROM residential_credentials WHERE ip = ?').bind(data.ip).run();
-        } else {
-            const validSecret = value => typeof value === 'string' && new TextEncoder().encode(value).length >= 1 && new TextEncoder().encode(value).length <= 255 && !/[\x00-\x1f\x7f]/.test(value);
-            if ((data.inherit !== undefined && data.inherit !== false) || !validSecret(data.user) || data.user.includes(':') || !validSecret(data.pass)) return Response.json({ error: 'Provide a complete SOCKS5 username/password pair (1-255 bytes, no control characters; username cannot contain colon)' }, { status: 400 });
-            await db.prepare('INSERT INTO residential_credentials (ip, username, password) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET username = excluded.username, password = excluded.password').bind(data.ip, data.user, data.pass).run();
-        }
-        const credentials = await residentialCredentials(db, env, data.ip);
-        // No refresh command: credentials can be staged before the pilot switches controllers.
-        return Response.json({ success: true, ip: data.ip, source: credentials.source, configured: !!(credentials.user && credentials.pass) }, { headers: { 'Cache-Control': 'no-store' } });
-    }
+    const proxyUser = env.PROXY_USER || '';
+    const proxyPass = env.PROXY_PASS || '';
+    if (!proxyUser || !proxyPass) return Response.json({ error: 'PROXY_USER and PROXY_PASS must be configured' }, { status: 503 });
 
     if (subPath === 'config') {
-        const data = method === 'POST' ? await req.json() : null;
-        const credentials = await residentialCredentials(db, env, data?.ip || url.searchParams.get('ip'));
-        const proxyUser = credentials.user, proxyPass = credentials.pass;
-        if (!proxyUser || !proxyPass) return Response.json({ error: 'Residential proxy credentials must be configured' }, { status: 503 });
         if (method === 'GET') {
             try {
                 const requestIp = url.searchParams.get('ip');
@@ -903,6 +865,7 @@ async function proxyLocal(method, subPath, req, env, body = null) {
         }
         if (method === 'POST') {
             try {
+                const data = await req.json();
                 const configKey = data.ip ? `proxy_slot_map_${data.ip}` : 'proxy_slot_map';
                 const existingRow = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(configKey).first();
                 let existing = {};
@@ -913,7 +876,7 @@ async function proxyLocal(method, subPath, req, env, body = null) {
                 if (data.mesh && typeof data.mesh === 'object') sanitized.mesh = data.mesh;
                 if (data.switch_trigger) sanitized.switch_trigger = data.switch_trigger;
                 await db.prepare("INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(configKey, JSON.stringify(sanitized)).run();
-                const proxyCfg = { enabled: sanitized.enabled !== false, port: sanitized.port, user: proxyUser, pass: proxyPass, country: rawCountry };
+                const proxyCfg = { enabled: true, port: sanitized.port, user: proxyUser, pass: proxyPass, country: rawCountry };
                 return new Response(JSON.stringify({ success: true, slot_map: sanitized, proxy: proxyCfg }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate' } });
             } catch (e) { console.error('[proxy-config-save] FAILED:', e.message); return new Response(JSON.stringify({ success: false, error: "CONFIG_WRITE_ERR: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
         }
@@ -960,12 +923,10 @@ async function proxyLocal(method, subPath, req, env, body = null) {
         const list = [];
         if (results) {
             for (const s of results) {
-                const { user: proxyUser, pass: proxyPass } = await residentialCredentials(db, env, s.ip);
-                if (!proxyUser || !proxyPass) continue;
                 const details = JSON.parse(s.details || '[]');
                 const node = details.find(d => d.active) || details[0];
-                if (node) list.push(`socks5://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${formatIpForLink(s.ip)}:${node.port}#${node.country}_ActiveNode_${node.node_ip || 'IP'}`);
-                else list.push(`socks5://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${formatIpForLink(s.ip)}:7920#Connecting_${s.ip}`);
+                if (node) list.push(`socks5://${proxyUser}:${proxyPass}@${s.ip}:${node.port}#${node.country}_ActiveNode_${node.node_ip || 'IP'}`);
+                else list.push(`socks5://${proxyUser}:${proxyPass}@${s.ip}:7920#Connecting_${s.ip}`);
             }
         }
         return new Response(list.join('\n'), { headers: { 'Content-Type': 'text/plain;charset=UTF-8' } });
@@ -1265,8 +1226,7 @@ export async function onRequest(context) {
             let port = 7920; try { port = parseInt(JSON.parse(slot?.value || '{}').port) || 7920; } catch (_) {}
             try { port = parseInt(JSON.parse(globalSlot?.value || '{}').port) || 7920; } catch (_) {}
             const localResidential = !env.PROXY_CTRL_URL;
-            const credentials = await residentialCredentials(db, env, ip);
-            residential_outbound = { available: localResidential && !!(credentials.user && credentials.pass), reason: localResidential ? '' : '外部住宅控制器模式未在本机安装 proxy-lite', addr: '127.0.0.1', port, user: agentAuthenticated && localResidential ? credentials.user : '', pass: agentAuthenticated && localResidential ? credentials.pass : '' };
+            residential_outbound = { available: localResidential && !!(env.PROXY_USER && env.PROXY_PASS), reason: localResidential ? '' : '外部住宅控制器模式未在本机安装 proxy-lite', addr: '127.0.0.1', port, user: agentAuthenticated && localResidential ? env.PROXY_USER || '' : '', pass: agentAuthenticated && localResidential ? env.PROXY_PASS || '' : '' };
         } catch (ex) {}
         const serverAuth = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
         const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
@@ -1306,7 +1266,7 @@ export async function onRequest(context) {
     // 🌟 住宅IP代理：优先外部控制器 (PROXY_CTRL_URL)；未配置时回落到本地 D1 实现
     if (action === "proxy") {
         const sub = params.path && params.path.length > 1 ? params.path.slice(1).join('/') : '';
-        const allowedProxyPaths = sub === 'credentials' || sub === 'config' || sub === 'report' || sub === 'proxies' || sub === 'nodes' || sub === 'countries' || sub === 'pool' || sub === 'switch' || sub.startsWith('testisp-lookup/');
+        const allowedProxyPaths = sub === 'config' || sub === 'report' || sub === 'proxies' || sub === 'nodes' || sub === 'countries' || sub === 'pool' || sub === 'switch' || sub.startsWith('testisp-lookup/');
         if (!allowedProxyPaths || sub.includes('..')) return new Response('Not Found', { status: 404 });
         if (sub === "mesh" || sub.startsWith("mesh/")) {
             return new Response(JSON.stringify({ error: "mesh is not supported" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -1324,10 +1284,6 @@ export async function onRequest(context) {
         } else {
             const user = await verifyAuth(request.headers.get('Authorization'), request, db, env, context);
             if (user !== (env.ADMIN_USERNAME || 'admin')) return new Response('Forbidden', { status: 403 });
-        }
-        if (sub === 'credentials') {
-            if (env.PROXY_CTRL_URL) return Response.json({ error: 'Per-server credentials require the local residential controller' }, { status: 409 });
-            return await proxyLocal(method, sub, request, env);
         }
         return await proxyBridge(method, sub, request, env);
     }
@@ -1529,14 +1485,12 @@ export async function onRequest(context) {
         // regular protocol nodes, so append them explicitly for the admin.
         // They include shared proxy credentials and must never be exposed to
         // ordinary user subscriptions.
-        if (reqUser === adminUser) {
+        if (reqUser === adminUser && env.PROXY_USER && env.PROXY_PASS) {
             try {
                 const cutoff = Date.now() - 1800000;
                 const { results: proxyServers } = await db.prepare('SELECT ip, details FROM proxy_ctrl_servers WHERE last_seen >= ?').bind(cutoff).all();
                 for (const server of proxyServers || []) {
                     if (ip && server.ip !== ip) continue;
-                    const credentials = await residentialCredentials(db, env, server.ip);
-                    if (!credentials.user || !credentials.pass) continue;
                     let details = [];
                     try { details = JSON.parse(server.details || '[]'); } catch {}
                     const active = details.find(detail => detail?.active && Number.isInteger(Number(detail.port)) && Number(detail.port) >= 1 && Number(detail.port) <= 65535);
@@ -1544,10 +1498,10 @@ export async function onRequest(context) {
                     const port = Number(active.port);
                     const serverIp = formatIpForLink(server.ip);
                     const name = `住宅 SOCKS5 | ${active.country || 'AUTO'} | ${server.ip}:${port}`;
-                    const encodedCredentials = btoa(unescape(encodeURIComponent(`${credentials.user}:${credentials.pass}`)));
+                    const encodedCredentials = btoa(unescape(encodeURIComponent(`${env.PROXY_USER}:${env.PROXY_PASS}`)));
                     subLinks.push(`socks5://${encodedCredentials}@${serverIp}:${port}#${encodeURIComponent(name)}`);
                     if (format === 'clash') {
-                        clashProxies.push(`  - name: ${yamlString(name)}\n    type: socks5\n    server: ${yamlString(serverIp)}\n    port: ${port}\n    username: ${yamlString(credentials.user)}\n    password: ${yamlString(credentials.pass)}\n    udp: true`);
+                        clashProxies.push(`  - name: ${yamlString(name)}\n    type: socks5\n    server: ${yamlString(serverIp)}\n    port: ${port}\n    username: ${yamlString(env.PROXY_USER)}\n    password: ${yamlString(env.PROXY_PASS)}\n    udp: true`);
                         proxyNames.push(yamlString(name));
                     }
                 }
@@ -1703,10 +1657,10 @@ rules:
         if (action === "vps" && isAdmin) {
             await ensureDbSchema(db);
             if (method === "POST") { const { ip, name } = await request.json(); if (!/^[0-9A-Fa-f:.]{2,64}$/.test(String(ip || ''))) return Response.json({ error: 'Invalid VPS IP' }, { status: 400 }); const agentToken = crypto.randomUUID(); const inserted = await db.prepare("INSERT INTO servers (ip, name, alert_sent, agent_token, sort_order) SELECT ?, ?, 0, ?, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM servers) WHERE (SELECT COUNT(*) FROM servers) < 100 ON CONFLICT(ip) DO NOTHING RETURNING ip").bind(ip, String(name || ip).slice(0, 100), agentToken).first(); if (!inserted) { if (await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(ip).first()) return Response.json({ error: 'VPS already exists' }, { status: 409 }); return Response.json({ error: "当前版本最多管理 100 台 VPS" }, { status: 409 }); } return Response.json({ success: true }); }
-            if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: 'IP required' }, { status: 400 }); if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 }); const modes = ['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']; if (!modes.includes(data.egress_mode)) return Response.json({ error: 'Invalid egress mode' }, { status: 400 }); if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 }); if (data.egress_mode === 'residential') { const credentials = await residentialCredentials(db, env, ip); if (!credentials.user || !credentials.pass) return Response.json({ error: '未配置住宅代理凭据' }, { status: 503 }); } const proxyMode = data.proxy_mode === 'selective' ? 'selective' : 'global'; const proxyCategories = data.proxy_categories ? String(data.proxy_categories) : ''; const socks5Addr = String(data.socks5_addr || '').slice(0, 128); const socks5Port = Math.min(65535, Math.max(1, Number(data.socks5_port) || 0)); const socks5User = String(data.socks5_user || '').slice(0, 64); const socks5Pass = String(data.socks5_pass || '').slice(0, 128); let changed; if (data.egress_mode === 'socks5' && socks5Addr && socks5Port) { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, socks5Addr, socks5Port, socks5User, socks5Pass, ip).first(); } else { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, ip).first(); } if (!changed) return Response.json({ error: 'VPS not found' }, { status: 404 }); context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {})); return Response.json({ success: true, ip, egress_mode: data.egress_mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, socks5_addr: data.egress_mode === 'socks5' ? socks5Addr : '', socks5_port: data.egress_mode === 'socks5' ? socks5Port : 0 }); }
+            if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: 'IP required' }, { status: 400 }); if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 }); const modes = ['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']; if (!modes.includes(data.egress_mode)) return Response.json({ error: 'Invalid egress mode' }, { status: 400 }); if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 }); if (data.egress_mode === 'residential' && (!env.PROXY_USER || !env.PROXY_PASS)) return Response.json({ error: 'Pages 未配置住宅代理凭据' }, { status: 503 }); const proxyMode = data.proxy_mode === 'selective' ? 'selective' : 'global'; const proxyCategories = data.proxy_categories ? String(data.proxy_categories) : ''; const socks5Addr = String(data.socks5_addr || '').slice(0, 128); const socks5Port = Math.min(65535, Math.max(1, Number(data.socks5_port) || 0)); const socks5User = String(data.socks5_user || '').slice(0, 64); const socks5Pass = String(data.socks5_pass || '').slice(0, 128); let changed; if (data.egress_mode === 'socks5' && socks5Addr && socks5Port) { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, socks5Addr, socks5Port, socks5User, socks5Pass, ip).first(); } else { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, ip).first(); } if (!changed) return Response.json({ error: 'VPS not found' }, { status: 404 }); context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {})); return Response.json({ success: true, ip, egress_mode: data.egress_mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, socks5_addr: data.egress_mode === 'socks5' ? socks5Addr : '', socks5_port: data.egress_mode === 'socks5' ? socks5Port : 0 }); }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
-                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM residential_credentials WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]);
+                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]);
                 return Response.json({ success: true }); 
             }
         }
