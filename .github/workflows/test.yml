@@ -14,7 +14,7 @@ jobs:
       cache: npm
    - run: npm ci
    - run: bash -n install-panel.sh && sh -n install.sh && node --check server.js
-   - run: python3 test/hy2-cert.py && python3 -m py_compile vendor/K-UI/vps/agent.py
+   - run: python3 -m py_compile vendor/K-UI/vps/agent.py && python3 test/agent-sync.py && python3 test/hy2-cert.py
    - run: node test/hy2-cert.mjs
    - run: node test/smoke.mjs
    - run: node test/sorting.mjs
