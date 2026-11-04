@@ -16,3 +16,4 @@ jobs:
    - run: bash -n install-panel.sh && sh -n install.sh && node --check server.js
    - run: node test/smoke.mjs
    - run: node test/sorting.mjs
+   - run: node test/residential-credentials.mjs
