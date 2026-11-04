@@ -104,6 +104,24 @@ last_update_check = 0
 # 🌟 住宅IP代理配置缓存
 current_proxy_config = {}
 proxy_port_conflict = None
+last_singbox_restart_at = None
+
+def pace_singbox_restart(last_restart, min_interval=5):
+    """Space actual service restarts so a burst cannot hit systemd's start limit."""
+    if last_restart is not None:
+        time.sleep(max(0, min_interval - (time.monotonic() - last_restart)))
+    return time.monotonic()
+
+def wait_for_config_wakeup(wakeup, timeout, quiet_seconds=2, max_wait=10):
+    """Coalesce refresh events while retaining a bounded periodic fallback."""
+    if not wakeup.wait(timeout=timeout):
+        return False
+    started = time.monotonic()
+    while True:
+        wakeup.clear()
+        remaining = min(quiet_seconds, max_wait - (time.monotonic() - started))
+        if remaining <= 0 or not wakeup.wait(timeout=remaining):
+            return True
 
 def persist_agent_token(token):
     global TOKEN, HEADERS
@@ -713,7 +731,7 @@ def build_chain_outbound(target, tag):
     return outbound
 
 def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_outbound=None, warp_mode="off"):
-    global proxy_port_conflict
+    global proxy_port_conflict, last_singbox_restart_at
     singbox_config = {
         "log": {"level": "warn"},
         "inbounds": [],
@@ -1019,6 +1037,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             os.chmod(backup_config + ".tmp", 0o600)
             os.replace(backup_config + ".tmp", backup_config)
         os.replace(temp_config, SINGBOX_CONF_PATH)
+        last_singbox_restart_at = pace_singbox_restart(last_singbox_restart_at)
         if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
             restarted = subprocess.run(["rc-service", "sing-box", "restart"], capture_output=True, text=True, timeout=30)
             healthy = restarted.returncode == 0 and subprocess.run(["rc-service", "sing-box", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15).returncode == 0
@@ -1031,15 +1050,19 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
                 with open(SINGBOX_CONF_PATH + ".rollback", "w") as rollback: rollback.write(old_config_str)
                 os.chmod(SINGBOX_CONF_PATH + ".rollback", 0o600)
                 os.replace(SINGBOX_CONF_PATH + ".rollback", SINGBOX_CONF_PATH)
+                last_singbox_restart_at = pace_singbox_restart(last_singbox_restart_at)
                 if os.path.exists("/etc/alpine-release"): subprocess.run(["rc-service", "sing-box", "restart"], timeout=30)
                 else: subprocess.run(["systemctl", "restart", "sing-box"], timeout=30)
                 rollback_healthy = _singbox_service_healthy()
             raise RuntimeError(f"sing-box restart failed; rollback_healthy={str(rollback_healthy).lower()}")
-    elif os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
-        subprocess.run(["rc-service", "sing-box", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        if not _singbox_service_healthy(): raise RuntimeError("sing-box is not healthy after start")
-    else:
-        subprocess.run(["systemctl", "start", "sing-box"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    elif not _singbox_service_healthy():
+        # A failed service can be retried on every refresh even when the config
+        # is unchanged; those starts count toward systemd's start limit too.
+        last_singbox_restart_at = pace_singbox_restart(last_singbox_restart_at)
+        if os.path.exists("/sbin/openrc-run") or os.path.exists("/etc/alpine-release"):
+            subprocess.run(["rc-service", "sing-box", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        else:
+            subprocess.run(["systemctl", "start", "sing-box"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         if not _singbox_service_healthy(): raise RuntimeError("sing-box is not healthy after start")
     if socks5_outbound and socks5_outbound.get("source") == "residential": _verify_residential_exit()
     if warp_mode != "off": _verify_warp_exit(warp_mode)
@@ -1373,7 +1396,6 @@ if __name__ == "__main__":
     if initial_nodes is not None: heartbeat_state["nodes"] = initial_nodes
     threading.Thread(target=heartbeat_loop, name="kui-heartbeat", daemon=True).start()
     while True:
-        config_wakeup.clear()
         while realtime_channel and realtime_channel.enabled and not realtime_channel.connected:
             grace_remaining = 30 - (time.time() - (realtime_channel.last_disconnected or realtime_channel.started_at))
             if grace_remaining <= 0:
@@ -1392,4 +1414,4 @@ if __name__ == "__main__":
         if elapsed > 20:
             print(f"[agent] slow loop completed in {elapsed:.1f}s", flush=True)
         config_interval = REALTIME_HTTP_INTERVAL if realtime_channel and realtime_channel.connected else (30 if fast_mode else 300)
-        config_wakeup.wait(timeout=max(1, config_interval - min(config_interval - 1, elapsed)))
+        wait_for_config_wakeup(config_wakeup, max(1, config_interval - min(config_interval - 1, elapsed)))
