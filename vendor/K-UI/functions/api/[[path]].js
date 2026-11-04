@@ -502,6 +502,11 @@ async function initializeDbSchema(db) {
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
     try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
+    for (const column of ['cert_sha256 TEXT', 'cert_sha256_at INTEGER DEFAULT 0']) {
+        try { await db.prepare(`ALTER TABLE nodes ADD COLUMN ${column}`).run(); } catch (e) {
+            if (!/duplicate column/i.test(String(e?.message || e))) throw e;
+        }
+    }
     try { await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
 
@@ -1071,6 +1076,21 @@ export async function onRequest(context) {
             return Response.json({ error: "Server has been removed from KUI panel." }, { status: 403 });
         }
         const serverName = kuiServer.name;
+        // Only an authenticated agent for this VPS may publish hashes for its
+        // own Hysteria2 nodes. Missing/invalid hashes must not retain old pins.
+        if (!duplicateReport && data.hysteria2_cert_hashes !== undefined) {
+            const hashes = data.hysteria2_cert_hashes;
+            if (!Array.isArray(hashes) || hashes.length > 200) return Response.json({ error: 'Invalid certificate hashes' }, { status: 400 });
+            const seen = new Set();
+            for (const item of hashes) {
+                if (!item || typeof item.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(item.id) || typeof item.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(item.sha256) || seen.has(item.id)) return Response.json({ error: 'Invalid certificate hash' }, { status: 400 });
+                seen.add(item.id);
+            }
+            await db.prepare("UPDATE nodes SET cert_sha256 = NULL, cert_sha256_at = 0 WHERE vps_ip = ? AND protocol = 'Hysteria2'").bind(vpsIp).run();
+            for (const item of hashes) {
+                await db.prepare("UPDATE nodes SET cert_sha256 = ?, cert_sha256_at = ? WHERE id = ? AND vps_ip = ? AND protocol = 'Hysteria2'").bind(item.sha256, nowMs, item.id, vpsIp).run();
+            }
+        }
 
         try { 
             await db.prepare("UPDATE servers SET cpu=?, mem=?, disk=?, load=?, uptime=?, net_in_speed=?, net_out_speed=?, tcp_conn=?, udp_conn=?, last_report=?, alert_sent=0 WHERE ip=?")
@@ -1350,7 +1370,13 @@ export async function onRequest(context) {
             switch (node.protocol) {
                 case "VLESS": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=none&type=tcp#${remark}`; break;
                 case "XTLS-Reality": case "Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=tcp&headerType=none#${remark}`; break;
-                case "Hysteria2": link = `hysteria2://${encodeURIComponent(node.uuid || node.private_key)}@${nodeIp}:${node.port}/?insecure=1&sni=${encodeURIComponent(nodeSni)}&alpn=h3#${remark}`; break;
+                case "Hysteria2": {
+                    const pin = Number(node.cert_sha256_at) > now - 2 * 3600 * 1000 && /^[a-f0-9]{64}$/.test(node.cert_sha256 || '') ? node.cert_sha256 : '';
+                    // Never publish an unpinned, skip-verification URI for a
+                    // self-signed node. Older agents must report the live cert.
+                    if (pin) link = `hysteria2://${encodeURIComponent(node.uuid || node.private_key)}@${nodeIp}:${node.port}/?sni=${encodeURIComponent(nodeSni)}&alpn=h3&pinSHA256=${pin}#${remark}`;
+                    break;
+                }
                 case "TUIC": link = `tuic://${node.uuid}:${node.private_key}@${nodeIp}:${node.port}?sni=${nodeSni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${remark}`; break;
                 case "Trojan": link = `trojan://${node.private_key}@${nodeIp}:${node.port}?security=tls&sni=${nodeSni}&allowInsecure=1&type=tcp#${remark}`; break;
                 case "H2-Reality": link = `vless://${node.uuid}@${nodeIp}:${node.port}?encryption=none&security=reality&sni=${nodeSni}&fp=chrome&pbk=${node.public_key}&sid=${node.short_id || ""}&type=http#${remark}`; break;

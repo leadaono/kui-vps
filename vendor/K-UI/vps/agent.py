@@ -1071,11 +1071,34 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             try: os.remove(os.path.join("/opt/kui/", filename))
             except OSError: pass
 
+def hysteria2_certificate_hashes(current_nodes, cert_dir="/opt/kui"):
+    """Report only public leaf certificate DER hashes, never keys or PEM."""
+    import hashlib
+    import ssl
+    hashes = []
+    for node in current_nodes:
+        if node.get("protocol") != "Hysteria2":
+            continue
+        node_id = str(node.get("id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", node_id):
+            continue
+        try:
+            with open(os.path.join(cert_dir, f"cert_{node_id}.pem"), "r", encoding="ascii") as cert_file:
+                pem = cert_file.read(16385)
+            match = re.fullmatch(r"\s*(-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----)\s*", pem)
+            if match and len(pem) <= 16384:
+                digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(match.group(1))).hexdigest()
+                hashes.append({"id": node_id, "sha256": digest})
+        except (OSError, ValueError):
+            continue
+    return hashes
+
 def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
     global last_reported_bytes, global_interval, fast_mode, dynamic_ping, pending_report_id, pending_report_bytes, pending_node_traffic, pending_report_payload, last_http_report
     status = get_system_status(global_interval)
     status["ip"] = VPS_IP
     status["argo_urls"] = argo_urls
+    status["hysteria2_cert_hashes"] = hysteria2_certificate_hashes(current_nodes)
     
     deltas = []
     pending_bytes = dict(last_reported_bytes)
@@ -1116,6 +1139,9 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
             pending_report_payload = dict(status)
             pending_report_payload["node_traffic"] = list(pending_node_traffic or [])
             _write_json_state(TRAFFIC_STATE_PATH, {"last_reported_bytes": last_reported_bytes, "pending": {"report_id": pending_report_id, "report_bytes": pending_report_bytes, "node_traffic": pending_node_traffic, "payload": pending_report_payload}})
+        # A queued traffic report may predate a certificate rotation. Refresh
+        # only the public hashes; never resend a stale pin with current traffic.
+        pending_report_payload["hysteria2_cert_hashes"] = status["hysteria2_cert_hashes"]
         req = urllib.request.Request(REPORT_URL, data=json.dumps(pending_report_payload).encode(), headers=HEADERS)
         with urllib.request.urlopen(req, timeout=5) as response:
             resp_data = json.loads(response.read().decode('utf-8'))
