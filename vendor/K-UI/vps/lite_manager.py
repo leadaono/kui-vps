@@ -55,7 +55,13 @@ realtime_channel = None
 config_wakeup = threading.Event()
 heartbeat_wakeup = threading.Event()
 last_http_report = 0
-REALTIME_HTTP_INTERVAL = 900
+last_http_attempt = 0
+last_attempt_signature = None
+last_persisted_signature = None
+first_active_report_attempted = False
+REALTIME_HTTP_INTERVAL = 300
+HTTP_CHANGE_MIN_INTERVAL = 15
+REALTIME_CONFIG_INTERVAL = 900
 REALTIME_STATUS_ACTIVE_INTERVAL = 5
 REALTIME_STATUS_IDLE_INTERVAL = 30
 realtime_status_interval = REALTIME_STATUS_ACTIVE_INTERVAL
@@ -288,10 +294,33 @@ def update_config_loop():
             print(f"[cfg] 拉取配置失败: {e}", flush=True)
             if realtime_channel and realtime_channel.connected:
                 realtime_channel.send({"success": False, "error": str(e)[:500], "applied_at": int(time.time() * 1000)}, "config.result")
-        config_wakeup.wait(timeout=REALTIME_HTTP_INTERVAL if realtime_channel and realtime_channel.connected else 300)
+        config_wakeup.wait(timeout=REALTIME_CONFIG_INTERVAL if realtime_channel and realtime_channel.connected else 300)
+
+def proxy_report_signature(details):
+    """Only subscription-relevant state; uptime and logs change every tick."""
+    return tuple(sorted((str(item.get("tunnel", "")), bool(item.get("active")),
+                         str(item.get("country", "")), int(item.get("port", 0)),
+                         str(item.get("node_ip", ""))) for item in details))
+
+def should_send_http_status(now, signature, persisted_signature, last_report,
+                            last_attempt, attempted_signature, websocket_sent, fallback_ready,
+                            first_active_attempted):
+    if not websocket_sent:
+        return fallback_ready and now - last_attempt >= HTTP_CHANGE_MIN_INTERVAL
+    # The first ACTIVE tunnel must reach the subscription DB immediately, even
+    # if the initial empty heartbeat was persisted only moments earlier.
+    was_active = any(item[1] for item in (persisted_signature or ()))
+    is_active = any(item[1] for item in signature)
+    if (is_active and not first_active_attempted and not was_active
+            and attempted_signature == persisted_signature and signature != attempted_signature):
+        return True
+    if now - last_attempt < HTTP_CHANGE_MIN_INTERVAL:
+        return False
+    return signature != persisted_signature or now - last_report >= REALTIME_HTTP_INTERVAL
 
 def c2_heartbeat_loop():
     global public_ip, PROXY_PORT, tun_main, tun_backup, last_http_report
+    global last_http_attempt, last_attempt_signature, last_persisted_signature, first_active_report_attempted
     while True:
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
@@ -311,13 +340,23 @@ def c2_heartbeat_loop():
         status = {"ip": VPS_IP, "socks_ip": public_ip, "details": details, "logs": get_recent_logs()}
         websocket_sent = realtime_channel.send(status) if realtime_channel and realtime_channel.connected else False
         try:
-            fallback_ready = not realtime_channel or not realtime_channel.enabled or time.time() - (realtime_channel.last_disconnected or realtime_channel.started_at) >= 30
-            if realtime_channel and realtime_channel.enabled and not websocket_sent and time.time() - realtime_channel.last_disconnected < 30:
+            now = time.time()
+            fallback_ready = not realtime_channel or not realtime_channel.enabled or now - (realtime_channel.last_disconnected or realtime_channel.started_at) >= 30
+            if realtime_channel and realtime_channel.enabled and not websocket_sent and now - realtime_channel.last_disconnected < 30:
                 fallback_ready = False
-            if (websocket_sent and time.time() - last_http_report >= REALTIME_HTTP_INTERVAL) or (not websocket_sent and fallback_ready):
+            signature = proxy_report_signature(details)
+            if should_send_http_status(now, signature, last_persisted_signature,
+                                       last_http_report, last_http_attempt,
+                                       last_attempt_signature, websocket_sent, fallback_ready,
+                                       first_active_report_attempted):
+                last_http_attempt = now
+                last_attempt_signature = signature
+                if any(item[1] for item in signature):
+                    first_active_report_attempted = True
                 req = urllib.request.Request(f"{C2_URL}{C2_API_PREFIX}/report", data=json.dumps(status).encode('utf-8'), headers=get_c2_headers(), method='POST')
                 with urllib.request.urlopen(req, timeout=10) as response: response.read(1)
                 last_http_report = time.time()
+                last_persisted_signature = signature
         except Exception as error:
             print(f"[c2] 状态上报失败: {error}", flush=True)
         if realtime_channel and realtime_channel.connected:
